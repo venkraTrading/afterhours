@@ -1,13 +1,24 @@
+import os
+import time
+from datetime import datetime, date, time as dtime, timezone
+from typing import List, Dict, Any
+
 import pandas as pd
 import requests
 import streamlit as st
 from pytz import timezone as pytz_tz
 
-# ── Setup ────────────────────────────────────────────
-API_KEY = os.getenv("POLYGON_API_KEY")
+# Read the key from env OR Streamlit Secrets (works on Streamlit Cloud)
+API_KEY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY")
+
 st.set_page_config(page_title="After-Hours Movers — Live", page_icon="⚡", layout="wide")
+
 if not API_KEY:
-    st.error("Set POLYGON_API_KEY in your shell first:  export POLYGON_API_KEY=YOUR_KEY")
+    st.error(
+        "POLYGON_API_KEY not found.\n\n"
+        "On Streamlit Cloud: Manage app → Settings → Secrets → add:\n"
+        "POLYGON_API_KEY = \"YOUR_KEY_HERE\""
+    )
     st.stop()
 
 NY = pytz_tz("America/New_York")
