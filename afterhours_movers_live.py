@@ -1,138 +1,230 @@
+#!/usr/bin/env python3
+# afterhours_movers_live.py
 import os
-import time
-from datetime import datetime, date, time as dtime, timezone
-from typing import List, Dict, Any
-
-import pandas as pd
+import math
 import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, time, timezone
+import pytz
 import streamlit as st
-from pytz import timezone as pytz_tz
 
-# Read the key from env OR Streamlit Secrets (works on Streamlit Cloud)
+# ─────────────────────────── Setup ───────────────────────────
+st.set_page_config(page_title="After/Pre-Market Movers (Live)", page_icon="📈", layout="wide")
+
 API_KEY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY")
-
-st.set_page_config(page_title="After-Hours Movers — Live", page_icon="⚡", layout="wide")
-
 if not API_KEY:
-    st.error(
-        "POLYGON_API_KEY not found.\n\n"
-        "On Streamlit Cloud: Manage app → Settings → Secrets → add:\n"
-        "POLYGON_API_KEY = \"YOUR_KEY_HERE\""
-    )
+    st.error("Missing POLYGON_API_KEY. Add it under **Settings → Secrets** or export it in the environment.")
     st.stop()
 
-NY = pytz_tz("America/New_York")
-st.title("⚡ After-Hours Movers (Live)")
+ET = pytz.timezone("America/New_York")
+SNAPSHOT_API = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
 
-# ── Controls ─────────────────────────────────────────
-c1, c2, c3, c4 = st.columns([1,1,1,1])
-with c1:
-    min_price = st.number_input("Min last price ($)", 0.0, 1e5, 2.0, 0.5)
-with c2:
-    min_vol = st.number_input("Min day volume (shares)", 0.0, 1e10, 200_000.0, 10_000.0)
-with c3:
-    top_n = st.number_input("Rows per table", 5, 100, 10, 1)
-with c4:
-    refresh_s = st.number_input("Auto refresh (sec)", 2, 60, 10, 1)
+# ───────────────────────── Controls ──────────────────────────
+st.title("📈 Live Movers — Pre-Market / Regular / After-Hours")
 
-st.caption("Reference price = today’s 16:00 ET regular-session **close**. "
-           "Only trades timestamped **after 16:00:00 ET** are included.")
+with st.sidebar:
+    st.subheader("Session & Options")
+    date_et = st.date_input("Trading date (ET)", value=datetime.now(ET).date())
+    session = st.radio(
+        "Session",
+        ["Pre-Market (04:00–09:30)", "Regular (09:30–16:00)", "After-Hours (16:00–20:00)"],
+        index=2,
+    )
+    top_n = st.slider("Top N (leaders / laggards)", 10, 100, 50, step=10)
+    include_otc = st.toggle("Include OTC", value=False, help="Snapshots can include OTC; usually keep disabled.")
+    min_prev_close = st.number_input("Min previous close ($)", value=1.0, step=0.5, help="Filter out pennies if you wish.")
+    only_has_trade = st.toggle("Require a trade in the chosen session", value=True)
 
-# ── Helpers ──────────────────────────────────────────
-def is_afterhours(ts_ns: int) -> bool:
-    ts_sec = ts_ns / 1_000_000_000
-    dt_utc = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
-    dt_et  = dt_utc.astimezone(NY)
-    et_close = datetime.combine(dt_et.date(), dtime(16,0,0), tzinfo=NY)
-    return dt_et >= et_close
+# ───────────────────── Helpers & Time Window ─────────────────
+def et_dt(y, m, d, hh, mm, ss=0):
+    return ET.localize(datetime(y, m, d, hh, mm, ss))
 
-def fetch_snapshots(limit_total: int = 6000) -> List[Dict[str, Any]]:
-    base = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+def session_window(et_date, which: str):
+    """Return (start_et, end_et) datetimes for session on a given ET date."""
+    y, m, d = et_date.year, et_date.month, et_date.day
+    if which.startswith("Pre-Market"):
+        return et_dt(y, m, d, 4, 0), et_dt(y, m, d, 9, 30)
+    if which.startswith("Regular"):
+        return et_dt(y, m, d, 9, 30), et_dt(y, m, d, 16, 0)
+    # After-Hours
+    return et_dt(y, m, d, 16, 0), et_dt(y, m, d, 20, 0)
+
+start_et, end_et = session_window(date_et, session)
+
+def to_et(ts_ns_or_ms):
+    """
+    Polygon snapshot lastTrade.t is in UNIX ns (nanoseconds). Some environments may
+    return ms. We'll detect by magnitude.
+    """
+    if ts_ns_or_ms is None:
+        return None
+    try:
+        t = int(ts_ns_or_ms)
+        # Heuristic: if timestamp is > 10^13, treat as ns; if ~10^12-10^13, also ns; else ms.
+        if t > 10**13:
+            dt_utc = datetime.fromtimestamp(t / 1e9, tz=timezone.utc)
+        else:
+            # treat as ms
+            dt_utc = datetime.fromtimestamp(t / 1e3, tz=timezone.utc)
+        return dt_utc.astimezone(ET)
+    except Exception:
+        return None
+
+def within_session(et_dt_obj, start_et, end_et):
+    if et_dt_obj is None:
+        return False
+    return start_et <= et_dt_obj <= end_et
+
+# ───────────────────────── Fetching ─────────────────────────
+@st.cache_data(ttl=30)  # small TTL to avoid hammering; update every reload/refresh button
+def fetch_snapshots(include_otc: bool):
+    """Paginate through all ticker snapshots."""
     params = {"limit": 1000, "apiKey": API_KEY}
-    out: List[Dict[str, Any]] = []
-    url = base
-    while url and len(out) < limit_total:
-        r = requests.get(url, params=params if url == base else None, timeout=30)
+    if include_otc:
+        params["include_otc"] = "true"
+
+    out = []
+    next_url = SNAPSHOT_API
+    pages = 0
+    while next_url and pages < 50:  # hard safety
+        pages += 1
+        r = requests.get(next_url, params=params if pages == 1 else None, timeout=30)
         r.raise_for_status()
-        j = r.json()
-        out.extend(j.get("tickers", []))
-        url = j.get("next_url")
-        if url and "apiKey=" not in url:
-            url += f"&apiKey={API_KEY}"
-    return out[:limit_total]
+        data = r.json()
+        tickers = data.get("tickers", []) or []
+        out.extend(tickers)
+        next_url = data.get("next_url")
+        if next_url and "apiKey=" not in next_url:
+            sep = "&" if "?" in next_url else "?"
+            next_url = f"{next_url}{sep}apiKey={API_KEY}"
+    return out
 
-def build_table(snaps: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for s in snaps:
-        sym  = s.get("ticker")
-        day  = (s.get("day") or {})
-        lt   = (s.get("lastTrade") or {})
+with st.spinner("Fetching snapshots…"):
+    try:
+        raw = fetch_snapshots(include_otc)
+    except requests.HTTPError as e:
+        st.error(f"HTTP {e.response.status_code}: {e.response.text[:300]}")
+        st.stop()
+    except Exception as e:
+        st.error(f"Fetch error: {e}")
+        st.stop()
 
-        price = lt.get("p")
-        ts_ns = lt.get("t")
-        close = day.get("c")
-        vol_day = day.get("v") or 0
+# ───────────────────── Build DataFrame safely ───────────────
+rows = []
+for rec in raw:
+    sym = rec.get("ticker")
+    if not sym:
+        continue
 
-        if price is None or ts_ns is None or close is None:
-            continue
-        if not is_afterhours(ts_ns):
-            continue
-        if price < float(min_price) or vol_day < float(min_vol):
-            continue
+    last_trade = (rec.get("lastTrade") or {})
+    last_px = last_trade.get("p")
+    last_ts = last_trade.get("t")
+    last_et = to_et(last_ts)
 
-        chg   = price - close
-        chg_p = (chg / close) * 100.0 if close else None
-        rows.append({
-            "SYMBOL": sym,
-            "PRICE": float(price),
-            "VOLUME": float(vol_day),
-            "CHG": float(chg),
-            "CHG %": float(chg_p) if chg_p is not None else None,
-            "Last Trade (ET)": datetime.fromtimestamp(ts_ns/1_000_000_000, tz=timezone.utc)
-                                  .astimezone(NY).strftime("%H:%M:%S"),
-        })
-    return pd.DataFrame(rows)
+    prev_day = rec.get("prevDay") or {}
+    prev_close = prev_day.get("c")  # previous RTH close
 
-def pretty_table(df: pd.DataFrame, positive: bool = True) -> "Styler":
-    if df.empty:
-        return df.style
-    fmt = {
-        "PRICE": "{:.2f}",
-        "VOLUME": "{:,.0f}",
-        "CHG": "{:.2f}",
-        "CHG %": "{:.2f}",
-    }
-    color = "#2e7d32" if positive else "#c62828"
-    sty = (df.style
-             .format(fmt)
-             .bar(subset=["CHG %"], color=color, vmin=0 if positive else None, vmax=None))
-    return sty
+    # (Optional) day volume (RTH). Not after-hours volume, but still useful for context.
+    day = rec.get("day") or {}
+    day_vol = day.get("v")
 
-# ── Run ──────────────────────────────────────────────
-with st.spinner("Fetching live snapshots…"):
-    snaps = fetch_snapshots()
+    # Skip if previous close missing or tiny
+    if prev_close is None or (min_prev_close and (prev_close < float(min_prev_close))):
+        continue
 
-df_all = build_table(snaps)
+    # If requiring an actual trade in the session, enforce time window
+    if only_has_trade and not within_session(last_et, start_et, end_et):
+        continue
 
+    # Compute change & pct
+    price = last_px if last_px is not None else np.nan
+    chg = np.nan
+    chg_pct = np.nan
+    if price == price and prev_close:  # price not NaN and prev_close not 0/None
+        chg = price - prev_close
+        if prev_close != 0:
+            chg_pct = (chg / prev_close) * 100.0
+
+    rows.append({
+        "Symbol": sym,
+        "Price": price,
+        "Ref Close": prev_close,
+        "CHG": chg,
+        "CHG %": chg_pct,
+        "Volume": day_vol,
+        "Last Trade (ET)": last_et.strftime("%H:%M:%S") if last_et else "",
+    })
+
+df_all = pd.DataFrame(rows)
+
+# ─────────── Defensive guards (fix KeyError: 'CHG %') ───────
+if df_all is None or len(df_all) == 0:
+    st.info("No rows matched your filters/time window. Try a different session, enable OTC, or relax the constraints.")
+    st.stop()
+
+# Normalize column names and types
+df_all.columns = [str(c).strip() for c in df_all.columns]
+
+for col in ["Price", "Ref Close", "CHG", "CHG %", "Volume"]:
+    if col in df_all.columns:
+        df_all[col] = pd.to_numeric(df_all[col], errors="coerce")
+
+# Recompute CHG % if missing / NaN
+def compute_chg_pct(df):
+    if {"Price", "Ref Close"}.issubset(df.columns):
+        prev = df["Ref Close"]
+        cur  = df["Price"]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return (cur - prev) / prev * 100.0
+    return pd.Series(np.nan, index=df.index)
+
+if "CHG %" not in df_all.columns or df_all["CHG %"].isna().all():
+    df_all["CHG %"] = compute_chg_pct(df_all)
+
+if "CHG %" not in df_all.columns or df_all["CHG %"].dropna().empty:
+    st.info("Couldn’t compute % change (missing price fields).")
+    st.dataframe(df_all)
+    st.stop()
+
+# ───────────────────── Leaders / Laggards ───────────────────
 leaders  = df_all[df_all["CHG %"] > 0].sort_values("CHG %", ascending=False).head(int(top_n))
-laggards = df_all[df_all["CHG %"] < 0].sort_values("CHG %", ascending=True).head(int(top_n))
+laggards = df_all[df_all["CHG %"] < 0].sort_values("CHG %", ascending=True ).head(int(top_n))
 
+# Display
 left, right = st.columns(2)
+display_cols = [c for c in ["Symbol", "Price", "Ref Close", "CHG", "CHG %", "Volume", "Last Trade (ET)"] if c in df_all.columns]
+
 with left:
-    st.subheader("LEADERS")
-    if leaders.empty:
-        st.info("No leaders meeting filters.")
-    else:
-        st.dataframe(pretty_table(leaders, positive=True), use_container_width=True)
+    st.subheader("🏆 Leaders")
+    st.dataframe(
+        leaders[display_cols].style.format({
+            "Price": "{:.2f}",
+            "Ref Close": "{:.2f}",
+            "CHG": "{:+.2f}",
+            "CHG %": "{:+.2f}",
+            "Volume": lambda v: f"{int(v):,}" if pd.notna(v) else ""
+        }).background_gradient(subset=["CHG %"], cmap="Greens"),
+        use_container_width=True,
+        hide_index=True
+    )
+
 with right:
-    st.subheader("LAGGARDS")
-    if laggards.empty:
-        st.info("No laggards meeting filters.")
-    else:
-        st.dataframe(pretty_table(laggards, positive=False), use_container_width=True)
+    st.subheader("⚠️ Laggards")
+    st.dataframe(
+        laggards[display_cols].style.format({
+            "Price": "{:.2f}",
+            "Ref Close": "{:.2f}",
+            "CHG": "{:+.2f}",
+            "CHG %": "{:+.2f}",
+            "Volume": lambda v: f"{int(v):,}" if pd.notna(v) else ""
+        }).background_gradient(subset=["CHG %"], cmap="Reds"),
+        use_container_width=True,
+        hide_index=True
+    )
 
-st.caption("Table Updated: " + datetime.now(tz=NY).strftime("%m/%d/%Y %H:%M:%S ET"))
-
-# Auto-refresh
-time.sleep(int(refresh_s))
-st.rerun()
+# Footer / hint
+st.caption(
+    "Note: Snapshot’s `day.v` is regular-hours volume, not extended-hours volume. "
+    "We filter movers by the **time of the last trade** within the selected session."
+)
