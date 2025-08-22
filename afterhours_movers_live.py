@@ -111,40 +111,87 @@ with st.spinner("Fetching snapshots…"):
         st.stop()
 
 # ───────────────────── Build DataFrame safely ───────────────
+# ───────────────────── Build DataFrame safely ───────────────
+def to_et(ts_ns_or_ms):
+    if ts_ns_or_ms is None:
+        return None
+    try:
+        t = int(ts_ns_or_ms)
+        # ns vs ms heuristic
+        if t > 10**13:
+            dt_utc = datetime.fromtimestamp(t / 1e9, tz=timezone.utc)
+        else:
+            dt_utc = datetime.fromtimestamp(t / 1e3, tz=timezone.utc)
+        return dt_utc.astimezone(ET)
+    except Exception:
+        return None
+
+def event_in_session(rec, start_et, end_et):
+    """
+    Return a tuple (in_session: bool, et_time: datetime|None, source: 'trade'|'quote'|None)
+    Prefers lastTrade; falls back to lastQuote.
+    """
+    lt = (rec.get("lastTrade") or {})
+    lq = (rec.get("lastQuote") or {})
+
+    lt_et = to_et(lt.get("t"))
+    lq_et = to_et(lq.get("t"))
+
+    # prefer trade if inside session
+    if lt_et and (start_et <= lt_et <= end_et):
+        return True, lt_et, "trade"
+    # else try quote
+    if lq_et and (start_et <= lq_et <= end_et):
+        return True, lq_et, "quote"
+
+    return False, lt_et or lq_et, None
+
 rows = []
 for rec in raw:
     sym = rec.get("ticker")
     if not sym:
         continue
 
-    last_trade = (rec.get("lastTrade") or {})
-    last_px = last_trade.get("p")
-    last_ts = last_trade.get("t")
-    last_et = to_et(last_ts)
-
     prev_day = rec.get("prevDay") or {}
-    prev_close = prev_day.get("c")  # previous RTH close
-
-    # (Optional) day volume (RTH). Not after-hours volume, but still useful for context.
-    day = rec.get("day") or {}
-    day_vol = day.get("v")
-
-    # Skip if previous close missing or tiny
+    prev_close = prev_day.get("c")
     if prev_close is None or (min_prev_close and (prev_close < float(min_prev_close))):
         continue
 
-    # If requiring an actual trade in the session, enforce time window
-    if only_has_trade and not within_session(last_et, start_et, end_et):
-        continue
+    last_trade = (rec.get("lastTrade") or {})
+    last_quote = (rec.get("lastQuote") or {})
 
-    # Compute change & pct
-    price = last_px if last_px is not None else np.nan
+    # price: prefer last trade price, fallback to quote mid if available, else quote ask/bid
+    price = last_trade.get("p")
+    if price is None:
+        # try quote mid
+        bp, ap = last_quote.get("bp"), last_quote.get("ap")
+        if bp is not None and ap is not None:
+            price = (bp + ap) / 2.0
+        else:
+            # fallback to whichever exists
+            price = ap if ap is not None else bp
+
+    # session gating (trade preferred; quote fallback)
+    in_sess, et_time, src = event_in_session(rec, start_et, end_et)
+    if only_has_trade:
+        # If user insists on "trade in session", keep only trades in session
+        lt_et = to_et(last_trade.get("t"))
+        if not (lt_et and (start_et <= lt_et <= end_et)):
+            continue
+    else:
+        # allow either trade or quote in session
+        if not in_sess:
+            continue
+
+    # compute change
     chg = np.nan
     chg_pct = np.nan
-    if price == price and prev_close:  # price not NaN and prev_close not 0/None
-        chg = price - prev_close
-        if prev_close != 0:
-            chg_pct = (chg / prev_close) * 100.0
+    if price is not None and prev_close not in (None, 0):
+        chg = float(price) - float(prev_close)
+        chg_pct = (chg / float(prev_close)) * 100.0
+
+    day = rec.get("day") or {}
+    day_vol = day.get("v")
 
     rows.append({
         "Symbol": sym,
@@ -153,7 +200,8 @@ for rec in raw:
         "CHG": chg,
         "CHG %": chg_pct,
         "Volume": day_vol,
-        "Last Trade (ET)": last_et.strftime("%H:%M:%S") if last_et else "",
+        "Last Trade (ET)": et_time.strftime("%H:%M:%S") if et_time else "",
+        "Event Src": src or "",  # shows 'trade' or 'quote' so you know why it matched
     })
 
 df_all = pd.DataFrame(rows)
