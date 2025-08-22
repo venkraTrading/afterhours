@@ -1,278 +1,292 @@
-#!/usr/bin/env python3
-# afterhours_movers_live.py
+# movers_unified.py
+# Streamlit app: Pre/Regular/After-hours movers (Polygon)
+#
+# Features:
+# - Session selector (Pre-Market / Regular / After-Hours)
+# - Leaders & Laggards tables by % change vs prior close
+# - Finviz link for every symbol
+# - Optional sector/SIC via Polygon reference endpoint (best-effort)
+# - Defaults: Min price = $5, Min volume = 2,000,000
+# - OTC toggle
+# - Robust session gating: prefer last trade in window; fall back to last quote
+
 import os
 import math
+import time
+from datetime import datetime, date, time as dtime, timezone, timedelta
+
 import requests
-import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, time, timezone
-import pytz
+import pandas as pd
 import streamlit as st
 
-# ─────────────────────────── Setup ───────────────────────────
-st.set_page_config(page_title="After/Pre-Market Movers (Live)", page_icon="📈", layout="wide")
-
-API_KEY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY")
+# ──────────────────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────────────────
+API_KEY = os.getenv("POLYGON_API_KEY")
 if not API_KEY:
-    st.error("Missing POLYGON_API_KEY. Add it under **Settings → Secrets** or export it in the environment.")
+    st.error("Missing POLYGON_API_KEY environment variable.")
     st.stop()
 
-ET = pytz.timezone("America/New_York")
-SNAPSHOT_API = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+ET = timezone(timedelta(hours=-5))  # Eastern without DST knowledge; for cloud simplicity
+# If you want more accurate ET with DST, install "pytz" and use: ET = pytz.timezone("US/Eastern")
 
-# ───────────────────────── Controls ──────────────────────────
-st.title("📈 Live Movers — Pre-Market / Regular / After-Hours")
+SESSION_DEFS = {
+    "Pre-Market (04:00–09:30 ET)": (dtime(4, 0), dtime(9, 30)),
+    "Regular (09:30–16:00 ET)":   (dtime(9, 30), dtime(16, 0)),
+    "After-Hours (16:00–20:00 ET)": (dtime(16, 0), dtime(20, 0)),
+}
 
-with st.sidebar:
-    st.subheader("Session & Options")
-    date_et = st.date_input("Trading date (ET)", value=datetime.now(ET).date())
-    session = st.radio(
-        "Session",
-        ["Pre-Market (04:00–09:30)", "Regular (09:30–16:00)", "After-Hours (16:00–20:00)"],
-        index=2,
-    )
-    top_n = st.slider("Top N (leaders / laggards)", 10, 100, 50, step=10)
-    include_otc = st.toggle("Include OTC", value=False, help="Snapshots can include OTC; usually keep disabled.")
-    min_prev_close = st.number_input("Min previous close ($)", value=1.0, step=0.5, help="Filter out pennies if you wish.")
-    only_has_trade = st.toggle("Require a trade in the chosen session", value=True)
-
-# ───────────────────── Helpers & Time Window ─────────────────
-def et_dt(y, m, d, hh, mm, ss=0):
-    return ET.localize(datetime(y, m, d, hh, mm, ss))
-
-def session_window(et_date, which: str):
-    """Return (start_et, end_et) datetimes for session on a given ET date."""
-    y, m, d = et_date.year, et_date.month, et_date.day
-    if which.startswith("Pre-Market"):
-        return et_dt(y, m, d, 4, 0), et_dt(y, m, d, 9, 30)
-    if which.startswith("Regular"):
-        return et_dt(y, m, d, 9, 30), et_dt(y, m, d, 16, 0)
-    # After-Hours
-    return et_dt(y, m, d, 16, 0), et_dt(y, m, d, 20, 0)
-
-start_et, end_et = session_window(date_et, session)
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=120, show_spinner=False)
+def polygon_get(url, params=None):
+    params = params or {}
+    params["apiKey"] = API_KEY
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    return r.json()
 
 def to_et(ts_ns_or_ms):
-    """
-    Polygon snapshot lastTrade.t is in UNIX ns (nanoseconds). Some environments may
-    return ms. We'll detect by magnitude.
-    """
+    """Convert Polygon ns/ms epoch to ET datetime (or None)."""
     if ts_ns_or_ms is None:
         return None
     try:
         t = int(ts_ns_or_ms)
-        # Heuristic: if timestamp is > 10^13, treat as ns; if ~10^12-10^13, also ns; else ms.
-        if t > 10**13:
-            dt_utc = datetime.fromtimestamp(t / 1e9, tz=timezone.utc)
-        else:
-            # treat as ms
-            dt_utc = datetime.fromtimestamp(t / 1e3, tz=timezone.utc)
-        return dt_utc.astimezone(ET)
     except Exception:
         return None
-
-def within_session(et_dt_obj, start_et, end_et):
-    if et_dt_obj is None:
-        return False
-    return start_et <= et_dt_obj <= end_et
-
-# ───────────────────────── Fetching ─────────────────────────
-@st.cache_data(ttl=30)  # small TTL to avoid hammering; update every reload/refresh button
-def fetch_snapshots(include_otc: bool):
-    """Paginate through all ticker snapshots."""
-    params = {"limit": 1000, "apiKey": API_KEY}
-    if include_otc:
-        params["include_otc"] = "true"
-
-    out = []
-    next_url = SNAPSHOT_API
-    pages = 0
-    while next_url and pages < 50:  # hard safety
-        pages += 1
-        r = requests.get(next_url, params=params if pages == 1 else None, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        tickers = data.get("tickers", []) or []
-        out.extend(tickers)
-        next_url = data.get("next_url")
-        if next_url and "apiKey=" not in next_url:
-            sep = "&" if "?" in next_url else "?"
-            next_url = f"{next_url}{sep}apiKey={API_KEY}"
-    return out
-
-with st.spinner("Fetching snapshots…"):
-    try:
-        raw = fetch_snapshots(include_otc)
-    except requests.HTTPError as e:
-        st.error(f"HTTP {e.response.status_code}: {e.response.text[:300]}")
-        st.stop()
-    except Exception as e:
-        st.error(f"Fetch error: {e}")
-        st.stop()
-
-# ───────────────────── Build DataFrame safely ───────────────
-# ───────────────────── Build DataFrame safely ───────────────
-def to_et(ts_ns_or_ms):
-    if ts_ns_or_ms is None:
-        return None
-    try:
-        t = int(ts_ns_or_ms)
-        # ns vs ms heuristic
-        if t > 10**13:
-            dt_utc = datetime.fromtimestamp(t / 1e9, tz=timezone.utc)
-        else:
-            dt_utc = datetime.fromtimestamp(t / 1e3, tz=timezone.utc)
-        return dt_utc.astimezone(ET)
-    except Exception:
-        return None
+    # Heuristic: ns vs ms
+    if t > 10**13:
+        dt_utc = datetime.fromtimestamp(t / 1e9, tz=timezone.utc)
+    else:
+        dt_utc = datetime.fromtimestamp(t / 1e3, tz=timezone.utc)
+    return dt_utc.astimezone(ET)
 
 def event_in_session(rec, start_et, end_et):
     """
-    Return a tuple (in_session: bool, et_time: datetime|None, source: 'trade'|'quote'|None)
-    Prefers lastTrade; falls back to lastQuote.
+    Return (in_session: bool, et_time: datetime|None, src: 'trade'|'quote'|None).
+    Prefer lastTrade if inside the window; else try lastQuote.
     """
-    lt = (rec.get("lastTrade") or {})
-    lq = (rec.get("lastQuote") or {})
+    lt = rec.get("lastTrade") or {}
+    lq = rec.get("lastQuote") or {}
 
     lt_et = to_et(lt.get("t"))
     lq_et = to_et(lq.get("t"))
 
-    # prefer trade if inside session
-    if lt_et and (start_et <= lt_et <= end_et):
+    if lt_et and start_et <= lt_et <= end_et:
         return True, lt_et, "trade"
-    # else try quote
-    if lq_et and (start_et <= lq_et <= end_et):
+    if lq_et and start_et <= lq_et <= end_et:
         return True, lq_et, "quote"
+    # return the freshest time we have for display even if out of session
+    return False, (lt_et or lq_et), None
 
-    return False, lt_et or lq_et, None
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_snapshots(include_otc: bool):
+    """
+    Pull all US stock snapshots (paginate). Returns list of snapshot dicts.
+    This is a heavy call; we cache a few minutes.
+    """
+    base = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers"
+    results = []
+    params = {"limit": 25000}
+    if include_otc:
+        params["include_otc"] = "true"
+    next_url = base
 
-rows = []
-for rec in raw:
-    sym = rec.get("ticker")
-    if not sym:
-        continue
+    while next_url:
+        data = polygon_get(next_url, params=params)
+        results.extend(data.get("tickers", []) or [])
+        next_url = data.get("next_url")  # already includes apiKey? No—Polygon omits it.
+        params = {}  # for next_url we must pass no params except apiKey (added in polygon_get)
 
-    prev_day = rec.get("prevDay") or {}
-    prev_close = prev_day.get("c")
-    if prev_close is None or (min_prev_close and (prev_close < float(min_prev_close))):
-        continue
+        # Safety guard if API ever loops
+        if len(results) > 500_000:
+            break
 
-    last_trade = (rec.get("lastTrade") or {})
-    last_quote = (rec.get("lastQuote") or {})
+    return results
 
-    # price: prefer last trade price, fallback to quote mid if available, else quote ask/bid
-    price = last_trade.get("p")
-    if price is None:
-        # try quote mid
-        bp, ap = last_quote.get("bp"), last_quote.get("ap")
-        if bp is not None and ap is not None:
-            price = (bp + ap) / 2.0
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_sic_description(ticker: str):
+    """
+    Best-effort sector/industry label using Polygon reference endpoint (SIC description).
+    Cached per symbol to keep calls light.
+    """
+    url = "https://api.polygon.io/v3/reference/tickers"
+    data = polygon_get(url, {"ticker": ticker, "limit": 1})
+    results = data.get("results") or []
+    if not results:
+        return None
+    # Prefer SIC description or industry-like field if present
+    res = results[0]
+    # Polygon commonly returns 'sic_description'. Fallbacks just in case.
+    return res.get("sic_description") or res.get("description") or res.get("name")
+
+def build_dataframe(raw, start_et, end_et, require_trade_in_session, min_ref_close, min_day_volume):
+    rows = []
+    for rec in raw:
+        sym = rec.get("ticker")
+        if not sym:
+            continue
+
+        prev = rec.get("prevDay") or {}
+        prev_close = prev.get("c")
+        if prev_close is None:
+            continue
+        if prev_close < min_ref_close:
+            continue
+
+        day = rec.get("day") or {}
+        day_vol = day.get("v")  # today’s running volume (RTH mainly; Polygon accumulates over day)
+        if day_vol is None or day_vol < min_day_volume:
+            continue
+
+        # Price: prefer last trade price; else quote mid; else ask/bid if one is missing
+        last_trade = rec.get("lastTrade") or {}
+        last_quote = rec.get("lastQuote") or {}
+        price = last_trade.get("p")
+        if price is None:
+            bp, ap = last_quote.get("bp"), last_quote.get("ap")
+            if bp is not None and ap is not None:
+                price = (bp + ap) / 2.0
+            else:
+                price = ap if ap is not None else bp
+
+        # Session inclusion
+        in_sess, et_time, src = event_in_session(rec, start_et, end_et)
+        if require_trade_in_session:
+            lt_et = to_et(last_trade.get("t"))
+            if not (lt_et and start_et <= lt_et <= end_et):
+                continue
         else:
-            # fallback to whichever exists
-            price = ap if ap is not None else bp
+            if not in_sess:
+                continue
 
-    # session gating (trade preferred; quote fallback)
-    in_sess, et_time, src = event_in_session(rec, start_et, end_et)
-    if only_has_trade:
-        # If user insists on "trade in session", keep only trades in session
-        lt_et = to_et(last_trade.get("t"))
-        if not (lt_et and (start_et <= lt_et <= end_et)):
-            continue
-    else:
-        # allow either trade or quote in session
-        if not in_sess:
-            continue
+        # Computes change vs prior close
+        chg = np.nan
+        chg_pct = np.nan
+        if price is not None and prev_close not in (None, 0):
+            chg = float(price) - float(prev_close)
+            chg_pct = (chg / float(prev_close)) * 100.0
 
-    # compute change
-    chg = np.nan
-    chg_pct = np.nan
-    if price is not None and prev_close not in (None, 0):
-        chg = float(price) - float(prev_close)
-        chg_pct = (chg / float(prev_close)) * 100.0
+        rows.append({
+            "Symbol": sym,
+            "Price": price,
+            "Prev Close": prev_close,
+            "CHG": chg,
+            "CHG %": chg_pct,
+            "Volume": day_vol,
+            "Last (ET)": et_time.strftime("%H:%M:%S") if et_time else "",
+            "Src": src or "",
+        })
 
-    day = rec.get("day") or {}
-    day_vol = day.get("v")
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # Optional sector/SIC; do in a batched, cached way to limit requests
+        # Only enrich top-N * 2 to save time; user can request more if needed
+        want = list(df["Symbol"].unique())[:400]
+        meta = {sym: fetch_sic_description(sym) for sym in want}
+        df["Sector / SIC"] = df["Symbol"].map(meta).fillna("—")
+    return df
 
-    rows.append({
-        "Symbol": sym,
-        "Price": price,
-        "Ref Close": prev_close,
-        "CHG": chg,
-        "CHG %": chg_pct,
-        "Volume": day_vol,
-        "Last Trade (ET)": et_time.strftime("%H:%M:%S") if et_time else "",
-        "Event Src": src or "",  # shows 'trade' or 'quote' so you know why it matched
-    })
+# ──────────────────────────────────────────────────────────────────────────────
+# UI
+# ──────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Unified Movers (Polygon)", page_icon="📈", layout="wide")
+st.title("📈 Unified Movers — Pre / Regular / After-Hours (Polygon)")
 
-df_all = pd.DataFrame(rows)
+with st.sidebar:
+    st.subheader("Scan Settings")
 
-# ─────────── Defensive guards (fix KeyError: 'CHG %') ───────
-if df_all is None or len(df_all) == 0:
-    st.info("No rows matched your filters/time window. Try a different session, enable OTC, or relax the constraints.")
-    st.stop()
+    session_label = st.selectbox(
+        "Session (ET)",
+        list(SESSION_DEFS.keys()),
+        index=2  # default After-Hours
+    )
+    d = st.date_input("Date (ET)", value=date.today())
 
-# Normalize column names and types
-df_all.columns = [str(c).strip() for c in df_all.columns]
+    # Filters
+    st.subheader("Filters")
+    include_otc = st.checkbox("Include OTC", value=False)
+    require_trade = st.checkbox("Require a trade in the session", value=False)
 
-for col in ["Price", "Ref Close", "CHG", "CHG %", "Volume"]:
-    if col in df_all.columns:
-        df_all[col] = pd.to_numeric(df_all[col], errors="coerce")
+    min_price = st.number_input("Min price (prior close) $", value=5.0, step=0.5, min_value=0.0)
+    min_vol = st.number_input("Min volume (today) shares", value=2_000_000, step=100_000, min_value=0)
 
-# Recompute CHG % if missing / NaN
-def compute_chg_pct(df):
-    if {"Price", "Ref Close"}.issubset(df.columns):
-        prev = df["Ref Close"]
-        cur  = df["Price"]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            return (cur - prev) / prev * 100.0
-    return pd.Series(np.nan, index=df.index)
+    top_n = st.slider("Show Top N by |% Change|", min_value=10, max_value=200, value=60, step=5)
 
-if "CHG %" not in df_all.columns or df_all["CHG %"].isna().all():
-    df_all["CHG %"] = compute_chg_pct(df_all)
+    # Manual refresh (avoid experimental autorefresh)
+    do_refresh = st.button("🔄 Refresh now")
 
-if "CHG %" not in df_all.columns or df_all["CHG %"].dropna().empty:
-    st.info("Couldn’t compute % change (missing price fields).")
-    st.dataframe(df_all)
-    st.stop()
+# Compute ET window
+start_t, end_t = SESSION_DEFS[session_label]
+start_et = datetime.combine(d, start_t, ET)
+end_et = datetime.combine(d, end_t, ET)
 
-# ───────────────────── Leaders / Laggards ───────────────────
-leaders  = df_all[df_all["CHG %"] > 0].sort_values("CHG %", ascending=False).head(int(top_n))
-laggards = df_all[df_all["CHG %"] < 0].sort_values("CHG %", ascending=True ).head(int(top_n))
+subtitle = f"Results — {start_et.strftime('%Y-%m-%d %H:%M')}–{end_et.strftime('%H:%M')} ET"
+st.markdown(f"**{subtitle}**")
 
-# Display
-left, right = st.columns(2)
-display_cols = [c for c in ["Symbol", "Price", "Ref Close", "CHG", "CHG %", "Volume", "Last Trade (ET)"] if c in df_all.columns]
+# Fetch data
+with st.spinner("Fetching Polygon snapshots…"):
+    if do_refresh:
+        # bust caches
+        fetch_snapshots.clear()
+        fetch_sic_description.clear()
 
-with left:
-    st.subheader("🏆 Leaders")
-    st.dataframe(
-        leaders[display_cols].style.format({
-            "Price": "{:.2f}",
-            "Ref Close": "{:.2f}",
-            "CHG": "{:+.2f}",
-            "CHG %": "{:+.2f}",
-            "Volume": lambda v: f"{int(v):,}" if pd.notna(v) else ""
-        }).background_gradient(subset=["CHG %"], cmap="Greens"),
-        use_container_width=True,
-        hide_index=True
+    raw = fetch_snapshots(include_otc)
+    df_all = build_dataframe(
+        raw=raw,
+        start_et=start_et,
+        end_et=end_et,
+        require_trade_in_session=require_trade,
+        min_ref_close=float(min_price),
+        min_day_volume=int(min_vol),
     )
 
-with right:
-    st.subheader("⚠️ Laggards")
+# Guard for empty
+if df_all.empty:
+    st.warning("No rows matched your filters/time window. Try another session, enable OTC, or relax constraints.")
+    st.stop()
+
+# Rank, Leaders, Laggards
+df_all = df_all.sort_values("CHG %", ascending=False, na_position="last")
+leaders = df_all[df_all["CHG %"] > 0].head(int(top_n)).copy()
+laggards = df_all[df_all["CHG %"] < 0].tail(int(top_n)).copy()
+
+def finviz_link(sym):  # helper to make markdown link
+    return f"[{sym}](https://finviz.com/quote.ashx?t={sym})"
+
+def fmt_table(df: pd.DataFrame):
+    if df.empty:
+        return df
+    out = df.copy()
+    out.insert(0, " ", [finviz_link(s) for s in out["Symbol"]])
+    out["Price"] = out["Price"].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
+    out["Prev Close"] = out["Prev Close"].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "—")
+    out["CHG"] = out["CHG"].map(lambda x: f"{x:+.2f}" if pd.notna(x) else "—")
+    out["CHG %"] = out["CHG %"].map(lambda x: f"{x:+.2f}" if pd.notna(x) else "—")
+    out["Volume"] = out["Volume"].map(lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+    return out
+
+c1, c2 = st.columns(2)
+
+with c1:
+    st.subheader("Leaders")
     st.dataframe(
-        laggards[display_cols].style.format({
-            "Price": "{:.2f}",
-            "Ref Close": "{:.2f}",
-            "CHG": "{:+.2f}",
-            "CHG %": "{:+.2f}",
-            "Volume": lambda v: f"{int(v):,}" if pd.notna(v) else ""
-        }).background_gradient(subset=["CHG %"], cmap="Reds"),
+        fmt_table(leaders)[[" ", "Symbol", "Sector / SIC", "Price", "Prev Close", "CHG", "CHG %", "Volume", "Last (ET)", "Src"]],
         use_container_width=True,
-        hide_index=True
+        height=600,
+        hide_index=True,
     )
 
-# Footer / hint
-st.caption(
-    "Note: Snapshot’s `day.v` is regular-hours volume, not extended-hours volume. "
-    "We filter movers by the **time of the last trade** within the selected session."
-)
+with c2:
+    st.subheader("Laggards")
+    st.dataframe(
+        fmt_table(laggards)[[" ", "Symbol", "Sector / SIC", "Price", "Prev Close", "CHG", "CHG %", "Volume", "Last (ET)", "Src"]],
+        use_container_width=True,
+        height=600,
+        hide_index=True,
+    )
+
+st.caption("Tip: Click the ticker icon to open Finviz in a new tab. "
+           "‘Src’ shows whether the match came from a trade or a quote within the selected window.")
