@@ -2,3 +2,5 @@ streamlit>=1.36
 pandas
 requests
 pytz
+streamlit
+python-dateutil
