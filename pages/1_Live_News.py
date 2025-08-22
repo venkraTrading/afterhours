@@ -264,4 +264,43 @@ else:
         st.divider()
 
 # ───────────────────── Auto-Refresh (non-blocking) ───────────
-st.autorefresh(interval=refresh_sec * 1000, key="news_autorefresh")
+#st.autorefresh(interval=refresh_sec * 1000, key="news_autorefresh")
+
+# ───────────────────── Auto-Refresh (version-safe) ───────────
+# Prefer st_autorefresh if available; otherwise use a small JS fallback.
+try:
+    # Recent Streamlit versions expose this at top level.
+    from streamlit_autorefresh import st_autorefresh  # external helper (pip install streamlit-autorefresh)
+    _have_autorefresh_helper = True
+except Exception:
+    try:
+        # Some Streamlit builds bundle it internally
+        from streamlit.runtime.scriptrunner import add_script_run_ctx  # noqa
+        # If the import above works, Streamlit often also has st_autorefresh
+        # but to keep things robust, we’ll still guard below.
+        _have_autorefresh_helper = hasattr(st, "autorefresh")
+    except Exception:
+        _have_autorefresh_helper = False
+
+if _have_autorefresh_helper:
+    # Use the helper if present (either from the package or built-in)
+    try:
+        # If we imported from streamlit_autorefresh:
+        st_autorefresh(interval=refresh_sec * 1000, key="news_autorefresh")
+    except Exception:
+        # If your Streamlit actually exposes st.autorefresh()
+        if hasattr(st, "autorefresh"):
+            st.autorefresh(interval=refresh_sec * 1000, key="news_autorefresh")
+        else:
+            # final fallback
+            st.markdown(
+                f"<script>setTimeout(()=>window.location.reload(), {refresh_sec*1000});</script>",
+                unsafe_allow_html=True,
+            )
+else:
+    # Pure JS fallback (works everywhere)
+    st.markdown(
+        f"<script>setTimeout(()=>window.location.reload(), {refresh_sec*1000});</script>",
+        unsafe_allow_html=True,
+    )
+
