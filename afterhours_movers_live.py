@@ -1,5 +1,5 @@
 # afterhours_movers_live.py
-# Unified Movers (Polygon) — auto session with robust no-data handling
+# Enhanced Unified Movers (Polygon) — auto session with robust deployment support
 
 import os
 import math
@@ -10,18 +10,58 @@ from datetime import datetime, timedelta
 from dateutil import tz
 import pytz
 import streamlit as st
+from typing import Tuple, Optional, List, Dict, Any
+import asyncio
+import aiohttp
+from concurrent.futures import ThreadPoolExecutor
+import json
 
 # -------------- Config --------------
 
-API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-assert API_KEY, "POLYGON_API_KEY missing in environment"
+def get_api_key() -> str:
+    """Get API key with fallback options for deployment"""
+    # Try environment variable first
+    api_key = os.getenv("POLYGON_API_KEY", "").strip()
+    
+    # Try Streamlit secrets
+    if not api_key:
+        try:
+            api_key = st.secrets.get("POLYGON_API_KEY", "").strip()
+        except:
+            pass
+    
+    # If still no key, use session state or sidebar input
+    if not api_key:
+        if 'polygon_api_key' not in st.session_state:
+            st.session_state.polygon_api_key = ""
+        
+        if not st.session_state.polygon_api_key:
+            with st.sidebar:
+                st.error("⚠️ Polygon.io API Key Required")
+                api_key_input = st.text_input(
+                    "Enter your Polygon.io API Key:",
+                    type="password",
+                    help="Get your free API key from polygon.io",
+                    key="api_key_input"
+                )
+                if api_key_input:
+                    st.session_state.polygon_api_key = api_key_input
+                    st.rerun()
+                else:
+                    st.info("You can get a free API key from [polygon.io](https://polygon.io)")
+                    st.stop()
+        
+        api_key = st.session_state.polygon_api_key
+    
+    return api_key
 
 ET = pytz.timezone("America/New_York")
 
 MIN_PRICE_DEFAULT = 5.0        # $5+
-MIN_WINDOW_VOL_DEFAULT = 2_000_000  # ≥ 2M shares in the window
+MIN_WINDOW_VOL_DEFAULT = 1_000_000  # Reduced to 1M for better results
 TOPN_DEFAULT = 60
-UNIVERSE_CAP = 1200            # safety cap on symbols to iterate
+UNIVERSE_CAP = 800            # Reduced for better performance
+MAX_CONCURRENT_REQUESTS = 10   # Rate limiting
 
 # -------------- Helpers --------------
 
@@ -43,49 +83,83 @@ def session_window(now_et: datetime):
     rth_start, rth_end = dt(9, 30), dt(16, 0)
     ah_start, ah_end = dt(16, 0), dt(20, 0)
 
-    if pre_start <= now_et <= pre_end:
+    if pre_start <= now_et < pre_end:
         return "Pre-Market", pre_start, pre_end
-    elif rth_start <= now_et <= rth_end:
+    elif rth_start <= now_et < rth_end:
         return "Regular", rth_start, rth_end
-    elif ah_start <= now_et <= ah_end:
+    elif ah_start <= now_et < ah_end:
         return "After-Hours", ah_start, ah_end
     else:
-        # If we're outside any session, default to the nearest completed one (AH)
-        # so the app still shows something
-        return "After-Hours", ah_start, ah_end
+        # Outside trading hours - determine which session to show
+        if now_et.time() < pre_start.time():
+            # Before pre-market, show previous day's after hours
+            prev_day = (now_et - timedelta(days=1)).date()
+            prev_ah_start = ET.localize(datetime(prev_day.year, prev_day.month, prev_day.day, 16, 0))
+            prev_ah_end = ET.localize(datetime(prev_day.year, prev_day.month, prev_day.day, 20, 0))
+            return "After-Hours (Prev)", prev_ah_start, prev_ah_end
+        else:
+            # After hours ended, show today's after hours
+            return "After-Hours (Ended)", ah_start, ah_end
 
 def et_to_unix_ms(dt_et: datetime) -> int:
     """Convert timezone-aware ET datetime to unix ms."""
     return int(dt_et.timestamp() * 1000)
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def prev_trading_date():
-    """
-    Best-effort previous trading date (YYYY-MM-DD).
-    We ask Polygon marketstatus; if it fails, fallback to yesterday.
-    """
+    """Get previous trading date with caching"""
     try:
+        api_key = get_api_key()
         ms = requests.get(
             "https://api.polygon.io/v1/marketstatus/now",
-            params={"apiKey": API_KEY},
-            timeout=8,
+            params={"apiKey": api_key},
+            timeout=10,
         )
-        ms.raise_for_status()
-        # This endpoint doesn’t directly give prev date; we infer from ET "serverTime".
-        # We’ll just use yesterday in ET (good enough for grouped/RTH based universe).
-    except Exception:
-        pass
+        if ms.status_code == 200:
+            data = ms.json()
+            # Use the date info from market status if available
+            pass
+    except Exception as e:
+        st.warning(f"Could not fetch market status: {e}")
 
-    # Yesterday in ET (not UTC)
+    # Fallback: yesterday in ET
     y_et = et_now() - timedelta(days=1)
     return y_et.strftime("%Y-%m-%d")
 
 def poly_get(url, **params):
+    """Make API call with enhanced error handling"""
     params = dict(params or {})
-    params["apiKey"] = API_KEY
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    api_key = get_api_key()
+    params["apiKey"] = api_key
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            
+            if r.status_code == 429:  # Rate limited
+                wait_time = min(2 ** attempt, 10)  # Exponential backoff, max 10s
+                st.warning(f"Rate limited, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+            
+            r.raise_for_status()
+            return r.json()
+            
+        except requests.exceptions.Timeout:
+            if attempt == max_retries - 1:
+                st.error(f"Timeout after {max_retries} attempts")
+                raise
+            time.sleep(1)
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                st.error(f"API request failed: {e}")
+                raise
+            time.sleep(1)
+    
+    return {}
 
+@st.cache_data(ttl=600)  # Cache for 10 minutes
 def fetch_grouped(date_str, market="stocks"):
     """Grouped bars for RTH — used to build a universe of symbols."""
     try:
@@ -95,10 +169,12 @@ def fetch_grouped(date_str, market="stocks"):
         )
         if data.get("results"):
             return data["results"]
-    except Exception:
+    except Exception as e:
+        st.error(f"Error fetching grouped data: {e}")
         return []
     return []
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def fetch_prev_close(symbol):
     """Yesterday's close (adjusted)."""
     try:
@@ -115,16 +191,19 @@ def fetch_prev_close(symbol):
 def fetch_minute_window(symbol, start_et, end_et):
     """
     Get minute bars within a window and return (last_price, sum_volume).
-    If no bars, returns (None, 0).
+    Enhanced with better error handling and performance.
     """
     try:
+        start_date = start_et.strftime('%Y-%m-%d')
+        end_date = end_et.strftime('%Y-%m-%d')
+        
         data = poly_get(
-            f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/"
-            f"{start_et.strftime('%Y-%m-%d')}/{end_et.strftime('%Y-%m-%d')}",
+            f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start_date}/{end_date}",
             adjusted="true",
             sort="asc",
             limit=50000,
         )
+        
         results = data.get("results", [])
         if not results:
             return None, 0
@@ -132,7 +211,7 @@ def fetch_minute_window(symbol, start_et, end_et):
         start_ms = et_to_unix_ms(start_et)
         end_ms = et_to_unix_ms(end_et)
 
-        # keep bars that fall within [start_ms, end_ms)
+        # Filter bars within the time window
         bars = [b for b in results if start_ms <= b.get("t", 0) < end_ms]
         if not bars:
             return None, 0
@@ -140,13 +219,18 @@ def fetch_minute_window(symbol, start_et, end_et):
         last_price = bars[-1].get("c")
         tot_vol = sum(b.get("v", 0) for b in bars)
         return last_price, tot_vol
-    except Exception:
+        
+    except Exception as e:
+        # Don't spam errors for individual symbols
         return None, 0
 
 def finviz_link(symbol: str) -> str:
     return f"https://finviz.com/quote.ashx?t={symbol}"
 
-# Expected dataframe columns — used to guarantee schema even when empty
+def tradingview_link(symbol: str) -> str:
+    return f"https://www.tradingview.com/chart/?symbol={symbol}"
+
+# Expected dataframe columns
 EXPECTED_COLS = [
     "Symbol",
     "Price",
@@ -156,7 +240,7 @@ EXPECTED_COLS = [
     "Volume",
     "Last (ET)",
     "Src",
-    "Finviz",
+    "Charts",
 ]
 
 def empty_df():
@@ -164,26 +248,38 @@ def empty_df():
     df = pd.DataFrame({c: [] for c in EXPECTED_COLS})
     return df[EXPECTED_COLS]
 
-# -------------- Builder --------------
+# -------------- Enhanced Builder with Progress --------------
 
-def build_movers(min_price=MIN_PRICE_DEFAULT,
-                 min_window_vol=MIN_WINDOW_VOL_DEFAULT,
-                 include_otc=False):
+def build_movers_with_progress(min_price=MIN_PRICE_DEFAULT,
+                              min_window_vol=MIN_WINDOW_VOL_DEFAULT,
+                              include_otc=False):
     """
-    Build full df, and leaders/laggards tables. Always returns dataframes
-    with the EXPECTED_COLS schema (may be empty).
+    Build movers with progress bar and better error handling
     """
     now = et_now()
     sess_label, win_start, win_end = session_window(now)
 
-    # Universe from yesterday RTH grouped bars
+    # Show current session info
+    st.info(f"🕐 **Current Session**: {sess_label} | **Window**: {win_start.strftime('%H:%M')}–{win_end.strftime('%H:%M')} ET")
+
+    # Get universe
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    progress_text.text("📊 Fetching universe of stocks...")
     y = prev_trading_date()
     grouped = fetch_grouped(y, market="stocks")
+    
     if include_otc:
+        progress_text.text("📊 Adding OTC stocks...")
         grouped += fetch_grouped(y, market="otc")
 
-    # Light filter/trim universe
-    # (use grouped close as a proxy to filter out very low price names quickly)
+    if not grouped:
+        st.error("❌ Could not fetch stock universe. Please check your API key and try again.")
+        return empty_df(), empty_df(), empty_df(), (sess_label, win_start, win_end)
+
+    # Filter universe
+    progress_text.text("🔍 Filtering universe...")
     universe = []
     for g in grouped:
         sym = g.get("T")
@@ -195,146 +291,229 @@ def build_movers(min_price=MIN_PRICE_DEFAULT,
         if len(universe) >= UNIVERSE_CAP:
             break
 
-    rows = []
-    for i, sym in enumerate(universe):
-        # polite pacing to avoid spiky rate usage (and to be cloud-friendly)
-        if i and i % 200 == 0:
-            time.sleep(0.6)
-
-        pclose = fetch_prev_close(sym)
-        if not pclose or pclose <= 0:
-            continue
-
-        last, wvol = fetch_minute_window(sym, win_start, win_end)
-        if last is None:
-            continue
-        if wvol < min_window_vol:
-            continue
-
-        chg = last - pclose
-        chg_pct = (chg / pclose) * 100.0
-
-        rows.append({
-            "Symbol": sym,
-            "Price": round(last, 2) if isinstance(last, (float, int)) else last,
-            "Prev Close": round(pclose, 2),
-            "CHG": round(chg, 2),
-            "CHG %": round(chg_pct, 2),
-            "Volume": int(wvol),
-            "Last (ET)": win_end.strftime("%H:%M"),
-            "Src": sess_label,
-            "Finviz": f"[Open]({finviz_link(sym)})",
-        })
-
-    if not rows:
+    if not universe:
+        st.warning("⚠️ No stocks found matching price criteria.")
         return empty_df(), empty_df(), empty_df(), (sess_label, win_start, win_end)
 
+    # Process symbols with progress tracking
+    rows = []
+    total_symbols = len(universe)
+    batch_size = 50  # Process in batches to manage memory
+    
+    for batch_start in range(0, total_symbols, batch_size):
+        batch_end = min(batch_start + batch_size, total_symbols)
+        batch = universe[batch_start:batch_end]
+        
+        progress_text.text(f"📈 Processing symbols {batch_start + 1}-{batch_end} of {total_symbols}...")
+        progress = (batch_end) / total_symbols
+        progress_bar.progress(progress)
+        
+        for i, sym in enumerate(batch):
+            try:
+                # Rate limiting: small delay every few requests
+                if (batch_start + i) % 10 == 0 and (batch_start + i) > 0:
+                    time.sleep(0.3)  # Reduced delay
+                
+                pclose = fetch_prev_close(sym)
+                if not pclose or pclose <= 0:
+                    continue
+
+                last, wvol = fetch_minute_window(sym, win_start, win_end)
+                if last is None or wvol < min_window_vol:
+                    continue
+
+                chg = last - pclose
+                chg_pct = (chg / pclose) * 100.0
+
+                rows.append({
+                    "Symbol": sym,
+                    "Price": round(last, 2) if isinstance(last, (float, int)) else last,
+                    "Prev Close": round(pclose, 2),
+                    "CHG": round(chg, 2),
+                    "CHG %": round(chg_pct, 2),
+                    "Volume": int(wvol),
+                    "Last (ET)": win_end.strftime("%H:%M"),
+                    "Src": sess_label,
+                    "Charts": f"[TV]({tradingview_link(sym)}) | [FV]({finviz_link(sym)})",
+                })
+                
+            except Exception as e:
+                # Skip problematic symbols silently
+                continue
+
+    # Clean up progress indicators
+    progress_text.empty()
+    progress_bar.empty()
+
+    if not rows:
+        st.warning("⚠️ No movers found matching your criteria. Try lowering the volume threshold or including OTC.")
+        return empty_df(), empty_df(), empty_df(), (sess_label, win_start, win_end)
+
+    # Create dataframe
     df = pd.DataFrame(rows)
-    # Guarantee the schema even if something got dropped
+    
+    # Ensure schema
     for col in EXPECTED_COLS:
         if col not in df.columns:
-            df[col] = []  # add empty
+            df[col] = []
 
     df = df[EXPECTED_COLS]
 
-    # Sort / slice safely
     if df.empty:
         return df, empty_df(), empty_df(), (sess_label, win_start, win_end)
 
+    # Sort and split
     df = df.sort_values("CHG %", ascending=False, na_position="last")
-
     leaders = df[df["CHG %"] > 0].copy()
     laggards = df[df["CHG %"] < 0].copy().sort_values("CHG %", ascending=True)
 
     return df, leaders, laggards, (sess_label, win_start, win_end)
 
-# -------------- UI --------------
+# -------------- Enhanced UI --------------
 
-st.set_page_config(page_title="Unified Movers — Auto Session (Polygon)", layout="wide")
+st.set_page_config(
+    page_title="Enhanced Movers — Auto Session (Polygon)", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-st.sidebar.header("Options")
-include_otc = st.sidebar.checkbox("Include OTC", value=False)
-topn = st.sidebar.slider("Show Top N by |% Change|", min_value=20, max_value=200, value=TOPN_DEFAULT, step=5)
-refresh = st.sidebar.button("Refresh")
+# Sidebar configuration
+st.sidebar.header("⚙️ Configuration")
 
+# API Key status
+api_key = get_api_key()
+if api_key:
+    st.sidebar.success("✅ API Key Configured")
+else:
+    st.sidebar.error("❌ API Key Missing")
+
+# Settings
+include_otc = st.sidebar.checkbox("Include OTC", value=False, help="Include over-the-counter stocks")
+min_price = st.sidebar.slider("Min Price ($)", min_value=1.0, max_value=50.0, value=MIN_PRICE_DEFAULT, step=0.5)
+min_volume = st.sidebar.slider("Min Volume (M)", min_value=0.5, max_value=10.0, value=MIN_WINDOW_VOL_DEFAULT/1_000_000, step=0.5) * 1_000_000
+topn = st.sidebar.slider("Show Top N", min_value=10, max_value=100, value=TOPN_DEFAULT, step=5)
+
+st.sidebar.markdown("---")
+auto_refresh = st.sidebar.checkbox("🔄 Auto-refresh (60s)", value=False)
+refresh = st.sidebar.button("🔄 Refresh Now", type="primary")
+
+# Display current time and session info
 now_et = et_now()
 sess_lbl, ws, we = session_window(now_et)
 
-st.title("⚡ Unified Movers — Auto Session (Polygon)")
-st.write(
-    f"**Now (ET)**: {now_et.strftime('%Y-%m-%d %H:%M:%S')} • "
-    f"**Session**: {sess_lbl} • "
-    f"**Window**: {ws.strftime('%H:%M')}–{we.strftime('%H:%M')} ET"
-)
+# Main title and info
+st.title("⚡ Enhanced Market Movers — Live Session Detection")
 
-with st.spinner("Building movers…"):
-    df_all, leaders, laggards, (sess_lbl, ws, we) = build_movers(
-        MIN_PRICE_DEFAULT,
-        MIN_WINDOW_VOL_DEFAULT,
-        include_otc=include_otc,
-    )
+# Time and session display
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Current Time (ET)", now_et.strftime('%H:%M:%S'))
+with col2:
+    st.metric("Current Session", sess_lbl)
+with col3:
+    st.metric("Session Window", f"{ws.strftime('%H:%M')}–{we.strftime('%H:%M')}")
 
-# Handle no data gracefully
-if df_all.empty:
-    st.warning(
-        "No rows matched your filters/time window. "
-        "This can happen especially early in Pre-Market or late in After-Hours.\n\n"
-        "Tips:\n"
-        "- Try enabling **Include OTC**.\n"
-        "- Try increasing the time window (wait a bit) or lowering the volume threshold inside the code "
-        "(defaults are $5+ and ≥ 2M shares within the window).\n"
-        "- Market holidays/half-days also impact availability."
-    )
+# Build movers data
+if api_key:
+    with st.spinner("🔄 Building movers data..."):
+        df_all, leaders, laggards, (sess_lbl, ws, we) = build_movers_with_progress(
+            min_price=min_price,
+            min_window_vol=min_volume,
+            include_otc=include_otc,
+        )
+
+    # Display results
+    if df_all.empty:
+        st.warning(
+            "📊 **No movers found matching your criteria.**\n\n"
+            "**Suggestions:**\n"
+            "- Lower the minimum price or volume thresholds\n"
+            "- Enable 'Include OTC' for more symbols\n"
+            "- Check if markets are currently active\n"
+            "- Verify your API key has sufficient quota"
+        )
+    else:
+        # Summary metrics
+        st.markdown("---")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Movers", len(df_all))
+        with col2:
+            st.metric("Leaders", len(leaders))
+        with col3:
+            st.metric("Laggards", len(laggards))
+        with col4:
+            if not df_all.empty:
+                avg_vol = df_all['Volume'].mean()
+                st.metric("Avg Volume", f"{avg_vol:,.0f}")
+
+        # Top movers tables
+        leaders_n = leaders.head(topn).copy()
+        laggards_n = laggards.head(topn).copy()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🚀 Top Gainers")
+            if not leaders_n.empty:
+                st.dataframe(
+                    leaders_n.style.format({
+                        "Price": "{:.2f}",
+                        "Prev Close": "{:.2f}",
+                        "CHG": "{:.2f}",
+                        "CHG %": "{:.2f}",
+                        "Volume": "{:,}",
+                    }),
+                    use_container_width=True,
+                    height=400,
+                )
+            else:
+                st.info("No gainers found")
+
+        with col2:
+            st.subheader("📉 Top Losers")
+            if not laggards_n.empty:
+                st.dataframe(
+                    laggards_n.style.format({
+                        "Price": "{:.2f}",
+                        "Prev Close": "{:.2f}",
+                        "CHG": "{:.2f}",
+                        "CHG %": "{:.2f}",
+                        "Volume": "{:,}",
+                    }),
+                    use_container_width=True,
+                    height=400,
+                )
+            else:
+                st.info("No losers found")
+
+        # Full data expandable section
+        st.markdown("---")
+        with st.expander("📋 Full Dataset", expanded=False):
+            st.dataframe(
+                df_all.style.format({
+                    "Price": "{:.2f}",
+                    "Prev Close": "{:.2f}",
+                    "CHG": "{:.2f}",
+                    "CHG %": "{:.2f}",
+                    "Volume": "{:,}",
+                }),
+                use_container_width=True,
+                height=500,
+            )
+
 else:
-    # Top N by absolute % change for the headline lists
-    leaders_n = leaders.head(topn).copy()
-    laggards_n = laggards.head(topn).copy()
+    st.error("⚠️ Please configure your Polygon.io API key to continue.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Leaders")
-        st.dataframe(
-            leaders_n.style.format({
-                "Price": "{:.2f}",
-                "Prev Close": "{:.2f}",
-                "CHG": "{:.2f}",
-                "CHG %": "{:.2f}",
-                "Volume": "{:,}",
-            }),
-            use_container_width=True,
-            height=480,
-        )
-    with col2:
-        st.subheader("Laggards")
-        st.dataframe(
-            laggards_n.style.format({
-                "Price": "{:.2f}",
-                "Prev Close": "{:.2f}",
-                "CHG": "{:.2f}",
-                "CHG %": "{:.2f}",
-                "Volume": "{:,}",
-            }),
-            use_container_width=True,
-            height=480,
-        )
-
-    st.markdown("---")
-    with st.expander("Full universe (filtered)", expanded=False):
-        st.dataframe(
-            df_all.style.format({
-                "Price": "{:.2f}",
-                "Prev Close": "{:.2f}",
-                "CHG": "{:.2f}",
-                "CHG %": "{:.2f}",
-                "Volume": "{:,}",
-            }),
-            use_container_width=True,
-            height=520,
-        )
-
+# Footer
+st.markdown("---")
 st.caption(
-    "Price = last price inside the detected session window versus **yesterday's adjusted close**. "
-    "Volume is the **sum of minute bars** inside the session window. "
-    "Links open **Finviz** for deeper context. "
-    "Defaults: $5+ & ≥2M shares in window; adjust in code if needed."
+    "📊 **Data Source**: Polygon.io • "
+    "💰 **Price**: Last trade in session window vs previous close • "
+    "📈 **Volume**: Sum of minute bars in session window • "
+    "🔗 **Charts**: TV = TradingView, FV = Finviz"
 )
+
+# Auto-refresh logic
+if auto_refresh and api_key:
+    time.sleep(60)
+    st.rerun()
