@@ -1,323 +1,348 @@
-# afterhours_movers_live.py
-# Simplified and robust Polygon.io market movers for Streamlit
+# unified_movers_app.py
+# Streamlit app: Unified Movers — Auto Session (Polygon)
+#
+# Features:
+# - Auto-detect session (Pre-Market / Regular / After-Hours), allow override
+# - Pulls Polygon snapshot gainers/losers (fast) then enriches top N with minute-window stats
+# - Computes session % change and volume using only the active window
+# - Min price $5+ and Min window volume 2,000,000 by default
+# - Finviz links, OTC toggle, strong caching to respect rate limits
 
 import os
 import time
+import math
+import zoneinfo
+from datetime import datetime, date, timedelta
+
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-import pytz
+import numpy as np
 import streamlit as st
 
-# -------------- Configuration --------------
+# -----------------------------
+# Config & helpers
+# -----------------------------
+ET = zoneinfo.ZoneInfo("America/New_York")
 
-def get_api_key():
-    """Get API key with multiple fallback options"""
-    # Try Streamlit secrets first
+def get_api_key() -> str:
+    # Order: st.secrets then env
+    key = st.secrets.get("POLYGON_API_KEY", None) if hasattr(st, "secrets") else None
+    return key or os.getenv("POLYGON_API_KEY", "")
+
+API_KEY = get_api_key()
+
+def poly_get(url: str, params: dict | None = None):
+    """GET helper with basic error handling."""
+    headers = {"Authorization": f"Bearer {API_KEY}"}
     try:
-        return st.secrets["POLYGON_API_KEY"]
-    except:
-        pass
-    
-    # Try environment variable
-    api_key = os.getenv("POLYGON_API_KEY", "").strip()
-    if api_key:
-        return api_key
-    
-    # Fallback to user input
-    return None
+        r = requests.get(url, headers=headers, params=params, timeout=15)
+        if r.status_code == 429:
+            # Rate limited: back off briefly
+            time.sleep(1.2)
+            r = requests.get(url, headers=headers, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        st.warning(f"Polygon error on {url.split('?')[0]}: {e}")
+        return None
 
-# Constants
-ET = pytz.timezone("America/New_York")
-MIN_PRICE_DEFAULT = 5.0
-MIN_VOLUME_DEFAULT = 1_000_000
-UNIVERSE_CAP = 500  # Reduced for reliability
+def now_et():
+    return datetime.now(tz=ET)
 
-# -------------- Helper Functions --------------
+def infer_session(ts: datetime):
+    # Return ("pre", "regular", or "after"), and window times in ET.
+    # Pre-market: 04:00–09:30, Regular: 09:30–16:00, After-hours: 16:00–20:00
+    d = ts.date()
+    pre_start  = datetime(d.year, d.month, d.day, 4, 0, tzinfo=ET)
+    rth_start  = datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET)
+    rth_end    = datetime(d.year, d.month, d.day, 16, 0, tzinfo=ET)
+    aft_end    = datetime(d.year, d.month, d.day, 20, 0, tzinfo=ET)
 
-def get_et_now():
-    """Get current time in Eastern timezone"""
-    return datetime.now(ET)
+    if ts < pre_start:
+        # before 04:00 — use last after-hours session of prior day
+        y = d - timedelta(days=1)
+        return ("after",
+                datetime(y.year, y.month, y.day, 16, 0, tzinfo=ET),
+                datetime(y.year, y.month, y.day, 20, 0, tzinfo=ET))
 
-def get_session_info(now_et):
-    """Determine current market session"""
-    current_time = now_et.time()
-    date = now_et.date()
-    
-    # Define session times
-    pre_start = datetime.combine(date, datetime.min.time().replace(hour=4)).replace(tzinfo=ET)
-    market_open = datetime.combine(date, datetime.min.time().replace(hour=9, minute=30)).replace(tzinfo=ET)
-    market_close = datetime.combine(date, datetime.min.time().replace(hour=16)).replace(tzinfo=ET)
-    after_end = datetime.combine(date, datetime.min.time().replace(hour=20)).replace(tzinfo=ET)
-    
-    if pre_start.time() <= current_time < market_open.time():
-        return "Pre-Market", pre_start, market_open
-    elif market_open.time() <= current_time < market_close.time():
-        return "Regular Hours", market_open, market_close
-    elif market_close.time() <= current_time < after_end.time():
-        return "After Hours", market_close, after_end
-    else:
-        return "Market Closed", market_close, after_end
+    if pre_start <= ts < rth_start:
+        return ("pre", pre_start, rth_start)
+    if rth_start <= ts < rth_end:
+        return ("regular", rth_start, rth_end)
+    if rth_end <= ts < aft_end:
+        return ("after", rth_end, aft_end)
+    # after 20:00 — keep after-hours window
+    return ("after", rth_end, aft_end)
 
-def make_api_request(url, params=None, max_retries=3):
-    """Make API request with retry logic"""
-    params = params or {}
-    
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, params=params, timeout=15)
-            
-            if response.status_code == 429:  # Rate limited
-                wait_time = min(2 ** attempt, 10)
-                time.sleep(wait_time)
-                continue
-                
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.RequestException:
-            if attempt == max_retries - 1:
-                return None
-            time.sleep(1)
-    
-    return None
+def dt_to_datestr(d: datetime) -> str:
+    return d.strftime("%Y-%m-%d")
 
-def get_stock_universe(api_key, date_str):
-    """Get list of stocks from grouped daily bars"""
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}"
-    params = {"apiKey": api_key, "adjusted": "true"}
-    
-    data = make_api_request(url, params)
-    if not data or not data.get("results"):
-        return []
-    
-    # Filter and limit universe
-    stocks = []
-    for result in data["results"]:
-        symbol = result.get("T")
-        close_price = result.get("c", 0)
-        
-        if symbol and close_price >= MIN_PRICE_DEFAULT:
-            stocks.append(symbol)
-            
-        if len(stocks) >= UNIVERSE_CAP:
-            break
-    
-    return stocks
+def et_to_unix_ms(d: datetime) -> int:
+    return int(d.timestamp() * 1000)
 
-def get_prev_close(api_key, symbol):
-    """Get previous close price for a symbol"""
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/prev"
-    params = {"apiKey": api_key, "adjusted": "true"}
-    
-    data = make_api_request(url, params)
-    if data and data.get("results"):
-        return data["results"][0].get("c")
-    return None
+# -----------------------------
+# Caching: snapshots & minute bars
+# -----------------------------
+@st.cache_data(ttl=30, show_spinner=False)
+def get_snapshot_movers(direction: str = "gainers", include_otc: bool = False):
+    """
+    Polygon snapshot top gainers/losers.
+    Docs: /v2/snapshot/locale/us/markets/stocks/gainers  (or losers)
+    """
+    base = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks"
+    url = f"{base}/{direction}"
+    params = {}
+    if include_otc:
+        params["include_otc"] = "true"
 
-def get_session_data(api_key, symbol, start_time, end_time):
-    """Get minute data for a session window"""
-    start_date = start_time.strftime("%Y-%m-%d")
-    end_date = end_time.strftime("%Y-%m-%d")
-    
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start_date}/{end_date}"
+    data = poly_get(url, params)
+    if not data or "tickers" not in data:
+        return pd.DataFrame(columns=[
+            "symbol","last","day_open","day_close","day_change","day_change_perc","prev_close",
+            "todays_change","todays_change_perc","updated_at"
+        ])
+
+    rows = []
+    for t in data.get("tickers", []):
+        # Defensive parsing
+        symbol = t.get("ticker")
+        last = (t.get("lastTrade") or {}).get("p")
+        updated = (t.get("lastTrade") or {}).get("t")
+        day = t.get("day", {}) or {}
+        prev = t.get("prevDay", {}) or {}
+        rows.append({
+            "symbol": symbol,
+            "last": last,
+            "day_open": day.get("o"),
+            "day_close": day.get("c"),
+            "day_change": day.get("c", np.nan) - day.get("o", np.nan) if all(x in day for x in ["o","c"]) else np.nan,
+            "day_change_perc": ( (day.get("c", np.nan)-day.get("o", np.nan)) / day.get("o", np.nan) * 100.0 )
+                if all(k in day for k in ["o","c"]) and day.get("o") else np.nan,
+            "prev_close": prev.get("c"),
+            "todays_change": t.get("todaysChange"),
+            "todays_change_perc": t.get("todaysChangePerc"),
+            "updated_at": updated
+        })
+    df = pd.DataFrame(rows)
+    return df
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_minute_aggs(symbol: str, start_et: datetime, end_et: datetime, adjusted: bool = True):
+    """
+    Fetch 1-minute aggs for the date of start_et, filter to [start_et, end_et].
+    Using /v2/aggs/ticker/{}/range/1/minute/{date}/{date}
+    """
+    d = start_et.date()
+    date_str = d.strftime("%Y-%m-%d")
+    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{date_str}/{date_str}"
     params = {
-        "apiKey": api_key,
-        "adjusted": "true",
+        "adjusted": "true" if adjusted else "false",
         "sort": "asc",
-        "limit": 50000
+        "limit": 50000,
     }
-    
-    data = make_api_request(url, params)
-    if not data or not data.get("results"):
-        return None, 0
-    
-    # Filter bars within session window
-    start_ms = int(start_time.timestamp() * 1000)
-    end_ms = int(end_time.timestamp() * 1000)
-    
-    session_bars = [
-        bar for bar in data["results"] 
-        if start_ms <= bar.get("t", 0) < end_ms
-    ]
-    
-    if not session_bars:
-        return None, 0
-    
-    last_price = session_bars[-1].get("c")
-    total_volume = sum(bar.get("v", 0) for bar in session_bars)
-    
-    return last_price, total_volume
+    data = poly_get(url, params=params)
+    if not data or data.get("resultsCount", 0) == 0:
+        return pd.DataFrame(columns=["t","o","h","l","c","v"])
 
-# -------------- Main App --------------
+    df = pd.DataFrame(data["results"])
+    # Polygon uses Unix ms in UTC; convert to ET
+    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True).dt.tz_convert(ET)
+    mask = (df["t"] >= start_et) & (df["t"] <= end_et)
+    df = df.loc[mask, ["t","o","h","l","c","v"]].reset_index(drop=True)
+    return df
 
-def main():
-    st.set_page_config(
-        page_title="Market Movers - Live",
-        page_icon="📈",
-        layout="wide"
+# -----------------------------
+# Build session metrics (enrichment)
+# -----------------------------
+def enrich_with_session(df_symbols: pd.DataFrame,
+                        session_label: str,
+                        start_et: datetime,
+                        end_et: datetime,
+                        min_price: float,
+                        min_window_vol: float,
+                        top_n: int):
+    """
+    For a (small) set of symbols from snapshots, fetch minute bars in the session window,
+    compute session metrics, filter, and rank by % change.
+    """
+    rows = []
+    # Keep count of API calls low – only enrich up to top_n * 2 from snapshots first
+    symbols = df_symbols["symbol"].dropna().astype(str).tolist()
+    symbols = symbols[: max(top_n * 2, 20)]
+
+    for sym in symbols:
+        m = get_minute_aggs(sym, start_et, end_et)
+        if m.empty:
+            continue
+
+        open_px  = m.iloc[0]["o"]
+        close_px = m.iloc[-1]["c"]
+        high_px  = m["h"].max()
+        low_px   = m["l"].min()
+        wvol     = float(m["v"].sum())
+
+        if not (isinstance(open_px, (int,float)) and isinstance(close_px, (int,float))):
+            continue
+        if open_px is None or open_px == 0 or np.isnan(open_px):
+            continue
+
+        change = close_px - open_px
+        pct    = (change / open_px) * 100.0
+
+        rows.append({
+            "Symbol": sym,
+            "Open": open_px,
+            "High": high_px,
+            "Low": low_px,
+            "Close": close_px,
+            "CHG %": pct,
+            "Window Vol": wvol,
+            "Finviz": f"https://finviz.com/quote.ashx?t={sym}",
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["Symbol","Open","High","Low","Close","CHG %","Window Vol","Finviz"])
+
+    out = pd.DataFrame(rows)
+
+    # Basic filters
+    out = out[(out["Close"] >= float(min_price)) & (out["Window Vol"] >= float(min_window_vol))]
+
+    # Rank by % change (abs if you want biggest movers regardless of sign)
+    out = out.sort_values("CHG %", ascending=False, na_position="last").head(int(top_n)).reset_index(drop=True)
+
+    # Human-friendly formatting (keep numeric dtypes for sorting, show nice in UI)
+    return out
+
+# -----------------------------
+# UI
+# -----------------------------
+st.set_page_config(page_title="Unified Movers — Auto Session (Polygon)", layout="wide", page_icon="⚡")
+st.title("⚡ Unified Movers — Auto Session (Polygon)")
+
+if not API_KEY:
+    st.error("No Polygon API key found. Set `POLYGON_API_KEY` in Secrets or environment.")
+    st.stop()
+
+now = now_et()
+auto_session, auto_start, auto_end = infer_session(now)
+
+# Sidebar
+st.sidebar.header("Options")
+
+include_otc = st.sidebar.checkbox("Include OTC", value=False)
+direction = st.sidebar.selectbox("List", ["Gainers", "Losers"], index=0)
+session_pick = st.sidebar.selectbox("Session", ["Auto (current)", "Pre-Market", "Regular", "After-Hours"], index=0)
+
+# Defaults requested
+min_price_default = 5.00
+min_vol_default = 2_000_000
+
+top_n = st.sidebar.slider("Show Top N by |% Change|", min_value=10, max_value=200, value=60, step=5)
+
+# Resolve session
+session_label = auto_session
+start_et = auto_start
+end_et = auto_end
+if session_pick != "Auto (current)":
+    d = now.date()
+    if session_pick == "Pre-Market":
+        start_et = datetime(d.year, d.month, d.day, 4, 0, tzinfo=ET)
+        end_et   = datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET)
+        session_label = "pre"
+    elif session_pick == "Regular":
+        start_et = datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET)
+        end_et   = datetime(d.year, d.month, d.day, 16, 0, tzinfo=ET)
+        session_label = "regular"
+    elif session_pick == "After-Hours":
+        start_et = datetime(d.year, d.month, d.day, 16, 0, tzinfo=ET)
+        end_et   = datetime(d.year, d.month, d.day, 20, 0, tzinfo=ET)
+        session_label = "after"
+
+colA, colB, colC = st.columns([1.2, 1.2, 2.4])
+with colA:
+    st.metric("Now (ET)", now.strftime("%Y-%m-%d %H:%M:%S"))
+with colB:
+    pretty = {"pre": "Pre-Market", "regular": "Regular", "after": "After-Hours"}.get(session_label, session_label)
+    st.metric("Session", pretty)
+with colC:
+    st.metric("Window", f"{start_et.strftime('%H:%M')}–{end_et.strftime('%H:%M')} ET")
+
+# -----------------------------
+# Fetch snapshots
+# -----------------------------
+with st.spinner(f"Fetching Polygon snapshot {direction.lower()}…"):
+    snap = get_snapshot_movers(
+        direction="gainers" if direction.lower() == "gainers" else "losers",
+        include_otc=include_otc
     )
-    
-    st.title("📈 Live Market Movers")
-    st.markdown("Real-time market data powered by Polygon.io")
-    
-    # Get API key
-    api_key = get_api_key()
-    
-    if not api_key:
-        st.error("🔑 **Polygon.io API Key Required**")
-        st.markdown("""
-        **Setup Instructions:**
-        1. Get your free API key from [polygon.io](https://polygon.io)
-        2. Add it to Streamlit Cloud secrets as `POLYGON_API_KEY`
-        3. Or set environment variable `POLYGON_API_KEY`
-        """)
-        
-        # Manual input as fallback
-        manual_key = st.text_input("Or enter your API key here:", type="password")
-        if manual_key:
-            api_key = manual_key
-        else:
-            st.stop()
-    
-    # Sidebar controls
-    st.sidebar.header("⚙️ Settings")
-    include_otc = st.sidebar.checkbox("Include OTC", value=False)
-    min_volume = st.sidebar.slider("Min Volume (M)", 0.5, 10.0, 1.0, 0.5) * 1_000_000
-    top_n = st.sidebar.slider("Show Top N", 10, 50, 20, 5)
-    
-    if st.sidebar.button("🔄 Refresh", type="primary"):
-        st.rerun()
-    
-    # Get current session info
-    now_et = get_et_now()
-    session_name, session_start, session_end = get_session_info(now_et)
-    
-    # Display current info
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Current Time (ET)", now_et.strftime("%H:%M:%S"))
-    with col2:
-        st.metric("Session", session_name)
-    with col3:
-        st.metric("Window", f"{session_start.strftime('%H:%M')}-{session_end.strftime('%H:%M')}")
-    
-    st.markdown("---")
-    
-    # Get data
-    with st.spinner("📊 Fetching market data..."):
-        # Get yesterday's date for universe
-        yesterday = (now_et - timedelta(days=1)).strftime("%Y-%m-%d")
-        
-        # Get stock universe
-        progress_text = st.empty()
-        progress_text.text("Getting stock universe...")
-        
-        universe = get_stock_universe(api_key, yesterday)
-        if not universe:
-            st.error("❌ Could not fetch stock universe. Please check your API key.")
-            st.stop()
-        
-        progress_text.text(f"Processing {len(universe)} stocks...")
-        
-        # Process stocks
-        movers_data = []
-        progress_bar = st.progress(0)
-        
-        for i, symbol in enumerate(universe):
-            # Update progress
-            progress = (i + 1) / len(universe)
-            progress_bar.progress(progress)
-            
-            # Rate limiting
-            if i > 0 and i % 10 == 0:
-                time.sleep(0.5)
-            
-            try:
-                # Get previous close
-                prev_close = get_prev_close(api_key, symbol)
-                if not prev_close:
-                    continue
-                
-                # Get session data
-                current_price, volume = get_session_data(api_key, symbol, session_start, session_end)
-                if not current_price or volume < min_volume:
-                    continue
-                
-                # Calculate change
-                change = current_price - prev_close
-                change_pct = (change / prev_close) * 100
-                
-                movers_data.append({
-                    "Symbol": symbol,
-                    "Price": round(current_price, 2),
-                    "Prev Close": round(prev_close, 2),
-                    "Change": round(change, 2),
-                    "Change %": round(change_pct, 2),
-                    "Volume": int(volume),
-                    "Chart": f"[View](https://finviz.com/quote.ashx?t={symbol})"
-                })
-                
-            except Exception:
-                continue
-        
-        # Clean up progress indicators
-        progress_text.empty()
-        progress_bar.empty()
-    
-    # Display results
-    if not movers_data:
-        st.warning("⚠️ No movers found matching criteria. Try lowering volume threshold.")
-        st.stop()
-    
-    # Create DataFrame
-    df = pd.DataFrame(movers_data)
-    df = df.sort_values("Change %", ascending=False)
-    
-    # Split into gainers and losers
-    gainers = df[df["Change %"] > 0].head(top_n)
-    losers = df[df["Change %"] < 0].head(top_n)
-    
-    # Display summary
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Movers", len(df))
-    with col2:
-        st.metric("Gainers", len(gainers))
-    with col3:
-        st.metric("Losers", len(losers))
-    
-    # Display tables
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("🚀 Top Gainers")
-        if len(gainers) > 0:
-            st.dataframe(
-                gainers,
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("No gainers found")
-    
-    with col2:
-        st.subheader("📉 Top Losers") 
-        if len(losers) > 0:
-            st.dataframe(
-                losers.sort_values("Change %", ascending=True),
-                use_container_width=True,
-                hide_index=True
-            )
-        else:
-            st.info("No losers found")
-    
-    # Full data
-    with st.expander("📋 All Movers", expanded=False):
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    
-    st.markdown("---")
-    st.caption(f"📊 Data from {session_name} session • Last updated: {now_et.strftime('%H:%M:%S')} ET")
 
-if __name__ == "__main__":
-    main()
+if snap.empty:
+    st.info("No snapshot tickers returned. Market may be closed or you are being rate limited. Try again shortly.")
+    st.stop()
+
+# Show snapshot summary (lightweight)
+with st.expander("Snapshot (raw from Polygon) — quick view", expanded=False):
+    slim = snap.loc[:, ["symbol","last","todays_change_perc","day_open","day_close","prev_close"]].copy()
+    slim.rename(columns={
+        "symbol":"Symbol","last":"Last","todays_change_perc":"Today %","day_open":"Day Open","day_close":"Day Close","prev_close":"Prev Close"
+    }, inplace=True)
+    st.dataframe(slim, use_container_width=True)
+
+# -----------------------------
+# Enrich the top snapshot set with minute window stats
+# -----------------------------
+min_price = min_price_default
+min_window_vol = min_vol_default
+
+with st.spinner("Building movers (minute window)…"):
+    df_enriched = enrich_with_session(
+        df_symbols=snap[["symbol"]].dropna(),
+        session_label=session_label,
+        start_et=start_et,
+        end_et=end_et,
+        min_price=min_price,
+        min_window_vol=min_window_vol,
+        top_n=top_n
+    )
+
+if df_enriched.empty:
+    st.warning("No rows matched filters **(min price $5+, session volume ≥ 2,000,000)** within this time window. "
+               "Try enabling OTC, increasing Top N, or switching session.")
+    st.stop()
+
+# Display
+def fmt_int(x):
+    try:
+        return f"{int(x):,}"
+    except:
+        try:
+            return f"{float(x):,.0f}"
+        except:
+            return x
+
+view = df_enriched.copy()
+view["Window Vol"] = view["Window Vol"].apply(fmt_int)
+view["Open"]  = view["Open"].map(lambda v: f"{v:,.2f}")
+view["High"]  = view["High"].map(lambda v: f"{v:,.2f}")
+view["Low"]   = view["Low"].map(lambda v: f"{v:,.2f}")
+view["Close"] = view["Close"].map(lambda v: f"{v:,.2f}")
+view["CHG %"] = view["CHG %"].map(lambda v: f"{v:,.2f}")
+
+st.dataframe(
+    view,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Symbol": st.column_config.TextColumn("Symbol"),
+        "Open": st.column_config.TextColumn("Open"),
+        "High": st.column_config.TextColumn("High"),
+        "Low": st.column_config.TextColumn("Low"),
+        "Close": st.column_config.TextColumn("Close"),
+        "CHG %": st.column_config.TextColumn("CHG %"),
+        "Window Vol": st.column_config.TextColumn("Window Vol"),
+        "Finviz": st.column_config.LinkColumn("Finviz", display_text="Open"),
+    },
+)
+
+st.caption("Tip: Results are cached for 30–60s to protect your Polygon limits. Multiple refreshes within that window reuse data.")
