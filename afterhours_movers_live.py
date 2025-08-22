@@ -11,9 +11,6 @@ from dateutil import tz
 import pytz
 import streamlit as st
 from typing import Tuple, Optional, List, Dict, Any
-import asyncio
-import aiohttp
-from concurrent.futures import ThreadPoolExecutor
 import json
 
 # -------------- Config --------------
@@ -61,7 +58,6 @@ MIN_PRICE_DEFAULT = 5.0        # $5+
 MIN_WINDOW_VOL_DEFAULT = 1_000_000  # Reduced to 1M for better results
 TOPN_DEFAULT = 60
 UNIVERSE_CAP = 800            # Reduced for better performance
-MAX_CONCURRENT_REQUESTS = 10   # Rate limiting
 
 # -------------- Helpers --------------
 
